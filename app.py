@@ -36,6 +36,8 @@ from dataclasses import astuple, dataclass, replace
 from functools import lru_cache
 
 import numpy as np
+import pandas as pd  # plotly'den önce: Streamlit soğuk başlangıçta pandas'ı başka iş parçacığında yüklerken
+#                      plotly yarım yüklenmiş modülü görüp "pd.Series yok" hatası veriyordu; import burada bekler
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
@@ -857,7 +859,6 @@ ROUTE_CSV = (("t", "Zaman t (s)"), ("x", "Konum x Doğu (m)"), ("y", "Konum y Ku
 
 def route_csv(res, ph, excel_tr=False):
     """Tüm zaman serisi (0.25 s aralıkla). excel_tr: Türkçe Excel için ';' ayraç ve virgüllü ondalık."""
-    import pandas as pd
     cols = {}
     for k, name in ROUTE_CSV:
         if k == "phase":
