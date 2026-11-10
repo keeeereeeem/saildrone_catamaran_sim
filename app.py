@@ -1803,15 +1803,15 @@ def cockpit_page(heading, delta_r, horizon, sail_type, tws_kt, trim_auto, trim_m
         def turn_name(rate):
             if abs(rate) <= 0.05:
                 return "Düz"
-            return ("Sancağa ↻" if rate > 0 else "İskeleye ↺") + \
-                   (" · orsa" if np.sign(rate) == np.sign(rel_wind) else " · boca")
+            luff = abs(rel_wind) > 179.5 or np.sign(rate) == np.sign(rel_wind)   # tam pupada her dönüş orsadır
+            return ("Sancağa ↻" if rate > 0 else "İskeleye ↺") + (" · orsa" if luff else " · boca")
 
         end_h = path[-1, 4] if len(path) > 1 else heading
         if dyn is None:                               # durağan denge var: değerler dengeden
             turn = turn_name(eq["r"]) if eq["V"] > 0 else "Düz"
             phi_row = _row("Hareket yönü φ", "—" if eq["V"] == 0 else f"{eq['course'] % 360:.1f}°",
                            "Teknenin suya göre gerçekte gittiği yön = pruva + drift", "#22D3EE")
-            r_row = _row("Dönüş", f"{eq['r']:+.2f}°/s", f"{turn}. + sancağa (saat yönü).", "#E2E8F0")
+            r_row = _row("Dönüş", f"{round(eq['r'], 2) + 0.0:+.2f}°/s", f"{turn}. + sancağa (saat yönü).", "#E2E8F0")
             R_row = _row("Dönüş yarıçapı", "∞" if not math.isfinite(eq["radius"]) else f"{eq['radius']:.1f} m",
                          "Durağan dönüş: R = V / r")
         else:                                         # denge yok: dinamik rotanın özeti
@@ -1821,7 +1821,7 @@ def cockpit_page(heading, delta_r, horizon, sail_type, tws_kt, trim_auto, trim_m
             phi_row = _row("Hareket yönü φ", phi_txt,
                            f"Durağan denge yok. Dinamik rotanın sonunda ({horizon} s) teknenin gerçekte gittiği yön."
                            + (" Tekne geri gidiyor." if dyn["astern_end"] else ""), "#22D3EE")
-            r_row = _row("Dönüş (ort.)", f"{dyn['rate']:+.2f}°/s",
+            r_row = _row("Dönüş (ort.)", f"{round(dyn['rate'], 2) + 0.0:+.2f}°/s",
                          f"Durağan denge yok; dinamik rotada {horizon} s boyunca ortalama dönüş hızı "
                          f"(net {dyn['dh']:+.0f}°). {turn_name(dyn['rate'])}. + sancağa (saat yönü).", "#E2E8F0")
             R_row = _row("Dönüş yarıçapı", "—", "Durağan dönüş yok (ileri denge hızı sıfır).")
@@ -1831,7 +1831,7 @@ def cockpit_page(heading, delta_r, horizon, sail_type, tws_kt, trim_auto, trim_m
             R_row,
             _row("Düz rota dümeni", "—" if eq["d_bal"] is None else f"{eq['d_bal']:+.1f}°",
                  "r = 0 için gereken merkezi dümen açısı (yelken + Munk momentini dengeler)", "#60A5FA"),
-            _row(f"{horizon} s sonra pruva", f"{end_h:.0f}°",
+            _row(f"{horizon} s sonra pruva", f"{round(end_h) % 360:.0f}°",
                  f"Dinamik rota sonunda net pruva değişimi {wrap180(end_h - heading):+.0f}°"),
             _row("Ölü açı sınırı", "—" if lim is None else f"±{lim:.1f}°",
                  "Kuvvet dengesinden (optimum trim, dümen 0). Eq.(12) referansı noktalı çizgide.", "#F87171"),
@@ -1881,7 +1881,7 @@ def cockpit_page(heading, delta_r, horizon, sail_type, tws_kt, trim_auto, trim_m
                                        tip + f"Pruva {horizon} s boyunca ölü açı sınırını (±{lim:.1f}°) geçemedi. "
                                              "Kurtulma: dümen ya da ters yelken manevrası." if lim is not None else
                                        tip + "Bu rüzgarda hiçbir pruvada ileri denge yok."))
-            elif len(esc):                            # ölü açıda değil, trim uygunsuz; sonradan yol alıyor
+            elif len(esc) and path[-1, 5] > 0.5 * KT2MS:   # ölü açıda değil, trim uygunsuz; sonradan yol alıyor
                 chips.append(_chip(f"↗ {path[esc[0], 2]:.0f} s'de yol alıyor", "#22C55E",
                                    tip + "Seçili trimle durağan ileri denge yok; pruva döndükçe tekne ileri "
                                          "yol almaya başlıyor."))

@@ -66,14 +66,14 @@ Pruvayı 45 / 90 / 135 / 180 yapıp şu satırlara bak: **Hareket yönü φ** (o
 
 ## F. A→B Rota: gözlem araçları
 
-Ayar: **Simülasyon** sayfası → **A→B Rota**, varsayılan senaryo (A 0,0 · B 200,0 · başlangıç sapması 30 m), Sert Kanat, 10 kt.
+Ayar: sol menüden **A→B Rota** sayfası, varsayılan senaryo (A 0,0 · B 200,0 · başlangıç sapması 30 m), Sert Kanat, 10 kt.
 
 | # | Ne yapılır | Beklenen |
 |---|------------|----------|
 | F1 | Grafiklerin üstündeki evre şeridine bak | **Yaklaşma** 0–59 s, **Oturma** 59–81 s, **Rotada** 81–189 s. Bir evreye tıklayınca o evrenin başına gider. Evreler grafiklerde gölge, haritada renkli nokta olarak görünür. |
 | F2 | Bir grafiğin üstündeki menüden başka parametre seç (ör. **Dönme momentleri**) | Grafik o parametreye geçer, çok serili grafiklerde renk açıklaması görünür. Sayfa yenilense de seçim kalır. |
-| F3 | Sayfanın altındaki **Özet** bölümü | Oturma başladı **59.0 s**, Rotaya oturdu **81.0 s**, Aşım **0.07 m**, En büyük dümen **−35°**, Rotada dümen **−0.2° ±0.2**, Yol verimi **%95**. Evre tablosunda dümen ortalaması Yaklaşma −8.2°, Oturma +4.7°, Rotada −0.2° olmalı. |
-| F4 | **CSV · Excel (Türkçe)** indirip Excel'de aç | 756 satır, 44 sütun; sütunlar ayrı ve ondalıklar virgüllü görünür. Python/MATLAB için **CSV · standart** kullanılır. |
+| F3 | Sağ paneldeki **Özet** sekmesi | Oturma başladı **59.0 s**, Rotaya oturdu **81.0 s**, Aşım **0.07 m**, En büyük dümen **−35°**, Rotada dümen **−0.2° ±0.2**, Yol verimi **%95**. Evre tablosunda dümen ortalaması Yaklaşma −8.2°, Oturma +4.7°, Rotada −0.2° olmalı. |
+| F4 | Özet sekmesinden **CSV · Excel (Türkçe)** indirip Excel'de aç | 756 satır, 44 sütun; sütunlar ayrı ve ondalıklar virgüllü görünür. Python/MATLAB için **CSV · standart** kullanılır. |
 
 ## G. Kumanda sayfası (`/kumanda`)
 

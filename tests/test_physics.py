@@ -298,16 +298,50 @@ def test_route_in_nogo_is_reported():
     assert r["track_nogo"] and r["status"] == "nogo"
 
 
-def test_ui_route_mode_renders():
+def _goto_page(at, *urls):
+    """st.navigation sayfasına geçer (AppTest.switch_page yalnız dosya sayfalarını destekliyor)."""
+    at._page_hash = next(h for h, i in at._registered_pages.items() if i.get("url_pathname") in urls)
+    return at.run()
+
+
+COCKPIT_URLS = ("", "pg_cockpit", "kokpit")
+
+
+def _page_text(at):
+    return " ".join(m.value for m in at.main.markdown)
+
+
+def _app():
     from streamlit.testing.v1 import AppTest
-    at = AppTest.from_file(os.path.join(os.path.dirname(app.__file__), "app.py"), default_timeout=300).run()
-    at.radio(key="mode").set_value("A→B Rota").run()
+    return AppTest.from_file(os.path.join(os.path.dirname(app.__file__), "app.py"), default_timeout=300).run()
+
+
+def test_ui_route_page_renders():
+    """A→B Rota ayrı sayfadır; açılır, rota kartlarını gösterir ve kokpite dönüş bozulmaz."""
+    at = _app()
+    _goto_page(at, app.ROUTE_URL)
     assert not at.exception
-    page = " ".join(m.value for m in at.markdown)
-    assert "Varış süresi" in page and "kaskad PID" in page
-    assert "Rotaya oturdu" in page and "Yaklaşma" in page and "Rotada" in page   # özet ve evre tablosu
-    at.radio(key="mode").set_value("Kokpit").run()       # kokpite geri dönüş bozulmamalı
+    page = _page_text(at)
+    assert "A→B Rota" in page and "Rota açısı χ" in page and "Rota TWA" in page
+    _goto_page(at, *COCKPIT_URLS)
     assert not at.exception and "APAZ" in _badge(at)
+
+
+def test_ui_cockpit_labels_edge_cases():
+    """Etiketler: pruva 0'da '360°' ve '-0.00' yazılmaz; tam pupada dönüş 'orsa'dır;
+    neredeyse duran tekne için 'yol alıyor' denmez."""
+    at = _app()
+    at.number_input(key="heading__n").set_value(0).run()
+    page = _page_text(at)
+    assert "360°" not in page and "-0.00°/s" not in page
+    at.number_input(key="heading__n").set_value(180).run()
+    page = _page_text(at)
+    assert "· orsa" in page and "· boca" not in page
+    at.number_input(key="heading__n").set_value(90).run()
+    [t for t in at.sidebar.toggle if "Otomatik yelken trimi" in t.label][0].set_value(False).run()
+    at.number_input(key="trim__n").set_value(90).run()         # kanat rüzgara hizalı: itiş yok
+    page = _page_text(at)
+    assert not at.exception and "yol alıyor" not in page and "Yol alamıyor" in page
 
 
 @pytest.mark.parametrize("sail", SAILS)
@@ -326,37 +360,27 @@ def test_route_phases_are_ordered_and_consistent(sail):
     assert 0.8 < ph["eff"] <= 1.0
 
 
-def _goto_page(at, *urls):
-    """st.navigation sayfasına geçer (AppTest.switch_page yalnız dosya sayfalarını destekliyor)."""
-    at._page_hash = next(h for h, i in at._registered_pages.items() if i.get("url_pathname") in urls)
-    return at.run()
-
-
-def test_ui_drive_is_a_separate_page():
-    """Kumanda ayrı sayfadır: simülasyon sayfasının mod seçiminde yoktur, kendi sayfasında mod seçimi yoktur."""
-    from streamlit.testing.v1 import AppTest
-    at = AppTest.from_file(os.path.join(os.path.dirname(app.__file__), "app.py"), default_timeout=300).run()
-    assert not at.exception and list(at.radio(key="mode").options) == ["Kokpit", "A→B Rota"]
-    assert "Kumanda ile sür" not in " ".join(m.value for m in at.markdown)
+def test_ui_three_separate_pages():
+    """Kokpit, A→B Rota ve Kumanda üç ayrı sayfadır; her biri hatasız açılır."""
+    at = _app()
+    urls = {i.get("url_pathname") for i in at._registered_pages.values()}
+    assert {app.ROUTE_URL, app.DRIVE_URL} <= urls and len(urls) == 3
+    assert not at.exception and "Kumanda ile sür" not in _page_text(at)
     _goto_page(at, app.DRIVE_URL)
-    assert not at.exception
-    assert "Kumanda ile sür" in " ".join(m.value for m in at.markdown)
-    assert not [r for r in at.radio if r.key == "mode"]
+    assert not at.exception and "Kumanda ile sür" in _page_text(at)
 
 
 def test_ui_settings_survive_page_change():
     """Senaryo ve sol menü ayarları sayfa değişince korunur (A→B ile Kumanda aynı senaryoyu kullanır)."""
-    from streamlit.testing.v1 import AppTest
-    at = AppTest.from_file(os.path.join(os.path.dirname(app.__file__), "app.py"), default_timeout=300).run()
-    at.radio(key="mode").set_value("A→B Rota").run()
+    at = _app()
+    _goto_page(at, app.ROUTE_URL)
     at.number_input(key="rt_e0__w").set_value(20.0).run()
     at.number_input(key="tws__n").set_value(12).run()
     _goto_page(at, app.DRIVE_URL)
     assert not at.exception
     assert at.number_input(key="rt_e0__w").value == 20.0 and at.number_input(key="tws__n").value == 12
-    _goto_page(at, "", "simulasyon")                      # geri dönüş: mod seçimi de korunur
-    assert not at.exception and at.radio(key="mode").value == "A→B Rota"
-    assert at.number_input(key="rt_e0__w").value == 20.0
+    _goto_page(at, app.ROUTE_URL)
+    assert not at.exception and at.number_input(key="rt_e0__w").value == 20.0
 
 
 def test_drive_html_is_complete():
