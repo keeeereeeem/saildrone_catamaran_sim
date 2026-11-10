@@ -43,6 +43,67 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # ----------------------------------------------------------------------------
+# Yeniden çalıştırmada kalıcı önbellek (yalnız performans; hiçbir sonucu değiştirmez)
+#   Streamlit her girdide bu dosyayı baştan çalıştırır; burada tanımlı @lru_cache fonksiyonları her seferinde
+#   YENİDEN tanımlandığı için önbellekleri boşalıyordu (ölü açı sınırı ve trim tablosu her girdide yeniden
+#   hesaplanıyordu). persistent_lru aynı lru_cache sarmalayıcısını oturumlar ve yeniden çalıştırmalar
+#   arasında saklar. Anahtar dosya içeriğinin özetini içerir: kod değişirse eski sonuç kullanılmaz.
+# ----------------------------------------------------------------------------
+import hashlib as _hashlib
+
+try:
+    with open(__file__, "rb") as _fh:
+        _APP_HASH = _hashlib.sha1(_fh.read()).hexdigest()
+except OSError:                                   # dosya okunamazsa kalıcılık kapalı (davranış eskisi gibi)
+    _APP_HASH = None
+
+
+@st.cache_resource(show_spinner=False)
+def _persistent_store():
+    import threading
+    return {"lock": threading.Lock(), "tables": {}}
+
+
+_MISSING = object()
+
+
+def _canon(a):
+    """Önbellek anahtarı: dataclass (Params) her çalıştırmada yeniden tanımlandığından sınıf kimliğiyle değil
+    alan DEĞERLERİYLE anahtarlanır."""
+    fl = getattr(a, "__dataclass_fields__", None)
+    return (type(a).__name__,) + tuple(getattr(a, f) for f in fl) if fl is not None else a
+
+
+def persistent_lru(maxsize):
+    """İki katman: (1) bu çalıştırmanın lru_cache'i (sıcak yol, değişmedi); (2) kaçırırsa kalıcı tablo."""
+    def deco(fn):
+        if _APP_HASH is None:
+            return lru_cache(maxsize=maxsize)(fn)
+        try:
+            ps = _persistent_store()
+        except Exception:                         # Streamlit dışında / önbellek kullanılamıyorsa
+            return lru_cache(maxsize=maxsize)(fn)
+        lock = ps["lock"]
+        with lock:
+            table = ps["tables"].setdefault((_APP_HASH, fn.__qualname__), {})
+
+        def slow(*args):
+            key = tuple(_canon(a) for a in args)
+            val = table.get(key, _MISSING)
+            if val is _MISSING:
+                val = fn(*args)
+                with lock:
+                    while len(table) >= 4 * maxsize:
+                        table.pop(next(iter(table)))
+                    table[key] = val
+            return val
+
+        slow.__name__, slow.__qualname__, slow.__doc__ = fn.__name__, fn.__qualname__, fn.__doc__
+        return lru_cache(maxsize=maxsize)(slow)
+    return deco
+
+
+# ----------------------------------------------------------------------------
 # Sabitler
 # ----------------------------------------------------------------------------
 KT2MS = 0.514444
@@ -96,7 +157,9 @@ class Params:
     Cd_cross: float = 1.0      # gövde çapraz akış sürükleme katsayısı (büyük drift açıları)
     max_leeway: float = 85.0   # °, sayısal sınır
     boom_rigid: bool = False   # bez yelken bumbası: False = ıskota (ip, yalnız çeker), True = rijit servo
-    k_munk: float = 1.0        # Munk momenti kalibrasyon katsayısı (1 = potansiyel akış teorisi)
+    k_munk: float = 1.0        # Munk momenti katsayısı — 1'de SABİT (menüden kaldırıldı). Munk momenti ideal akış
+    #                            etkisidir; ≠1 yapmak ek kütle Coriolis terimleriyle dengeyi bozup enerji üretir/yok
+    #                            eder. Viskoz etki ayrı bir kıç kuvvetidir (MIT 2.154 ders 8) → x_CLR ile ayarlanır.
     CDA_windage: float = 0.16  # m², su üstü yapı sürükleme alanı CD·A (gövde+kiriş+direk+kutu)
     h_CE: float = 0.75         # m, yelken basınç merkezi ↔ yanal direnç merkezi kolu
 
@@ -177,14 +240,21 @@ def point_of_sail(heading_deg, eq, limit):
         if limit is None or twa < limit:
             return "ÖLÜ AÇI (No-Go Zone)", "#C0392B", twa
         return "YOL YOK — trim uygun değil", "#8E44AD", twa
-    if twa < 80:
+    # Seyir adları (yalnız etiket; fiziğe girmez). Kanonik açılar: orsa ≈45°, apaz 90°, geniş apaz 135°,
+    # pupa 180° (Wikipedia "Point of sail"; Boğaziçi Yelken "Seyirler ve Manevralar"; TÜBİTAK Bilim ve Teknik).
+    # Sınırlar komşu kanonik açıların orta noktaları: 55° / 80° / 110° / 155°.
+    if twa < 55:
         return "ORSA", "#E67E22", twa
-    if twa < 150:
+    if twa < 80:
+        return "DAR APAZ", "#EAB308", twa
+    if twa < 110:
         return "APAZ", "#27AE60", twa
+    if twa < 155:
+        return "GENİŞ APAZ", "#14B8A6", twa
     return "PUPA", "#2980B9", twa
 
 
-@lru_cache(maxsize=32)
+@persistent_lru(maxsize=32)
 def _opt_trim_table(sail_type, p):
     """Her görünür rüzgar açısı β için yelken itişini (Fx) maksimum yapan |δs| (kuvvet hesabından).
     Kuvvetler a_aw²'ye orantılı olduğundan en iyi trim yalnızca β'ya bağlıdır."""
@@ -196,7 +266,29 @@ def _opt_trim_table(sail_type, p):
         aw_b = -np.array([math.cos(br), math.sin(br)])     # rüzgar sancaktan → yelken iskelede (δs<0)
         fx = [sail_forces(aw_b, -d_, sail_type, p)["Fx"] for d_ in deltas]
         best[i] = deltas[int(np.argmax(fx))]
-    return betas, best
+
+    def argmax_at(b_):
+        br = math.radians(b_)
+        aw_b = -np.array([math.cos(br), math.sin(br)])
+        fx = [sail_forces(aw_b, -d_, sail_type, p)["Fx"] for d_ in deltas]
+        return float(deltas[int(np.argmax(fx))])
+
+    # İki yerel optimum arasında geçiş (komşu noktalarda |Δδs| > 5°; ör. kanat β≈104°: "paraşüt" 90° ↔ "kanat"
+    # 52°): doğrusal karışım iki optimumdan da kötü bir ara açı verir. Geçiş β*'sını ikiye bölmeyle bul
+    # (24 adım → ~6e-8°), iki yanına o taraftaki optimumu koy. Fizik değişmez; yalnız tablo çözünürlüğü.
+    xs, ys = [betas[0]], [best[0]]
+    for i in range(1, len(betas)):
+        if abs(best[i] - best[i - 1]) > 5.0:
+            lo, hi, d_lo, d_hi = betas[i - 1], betas[i], best[i - 1], best[i]
+            for _ in range(24):
+                mid = 0.5 * (lo + hi); dm = argmax_at(mid)
+                if abs(dm - d_lo) <= abs(dm - d_hi):
+                    lo, d_lo = mid, dm
+                else:
+                    hi, d_hi = mid, dm
+            xs += [lo, hi]; ys += [d_lo, d_hi]
+        xs.append(betas[i]); ys.append(best[i])
+    return np.array(xs), np.array(ys)
 
 
 def optimal_trim_mag(beta_abs, sail_type, p):
@@ -213,6 +305,8 @@ def friction_coeff(V, p):
 # ----------------------------------------------------------------------------
 # Yelken aerodinamiği  (gövde ekseni: [ileri, sancak]; açılar pruvadan saat yönünde)
 # ----------------------------------------------------------------------------
+_REV_A = [0, 5, 10, 15, 20, 25, 90]                    # ters akışta etkin açı (°) = 180 − α
+_REV_DCD = [0.0171, 0.0437, 0.1216, 0.0400, 0.0230, 0.0, 0.0]   # Sheldahl Tablo 2: CD(180−a) − CD(a), Re 360k
 _SOFT_A = [8, 15, 22, 30, 45, 60, 90]                 # ° (VARSAYIM: tipik bez yelken eğrisi şekli)
 _SOFT_CL = [0.00, 1.15, 1.40, 1.30, 1.00, 0.65, 0.0]
 _SOFT_CD = [0.10, 0.15, 0.25, 0.40, 0.75, 1.00, 1.25]
@@ -239,7 +333,15 @@ def sail_coeffs(a_abs, sail_type, backwinded, p):
         CL_sep = p.CN_plate * math.sin(ar) * math.cos(ar)  # ayrılmış akış: normal kuvvet modeli
         CD_sep = CD0 + p.CN_plate * math.sin(ar) ** 2
         t = _smoothstep((a_e - p.alpha_stall) / 6.0)       # sürekli geçiş (sıçrama yok)
-        return sgn * ((1 - t) * CL_att + t * CL_sep), (1 - t) * CD_att + t * CD_sep, False, 0.25 + 0.25 * t
+        CL, CD = (1 - t) * CL_att + t * CL_sep, (1 - t) * CD_att + t * CD_sep
+        if sgn > 0:
+            return CL, CD, False, 0.25 + 0.25 * t
+        # TERS AKIŞ (firar kenarı önde): keskin kenarda akış ayrılır → profil sürüklemesi artar.
+        # ΔCD = ölçülen ters − ileri CD (NACA 0012, Sheldahl & Klimas 1981, SAND80-2114, Re 360k, Tablo 2).
+        # Basınç merkezi: ince kanat teorisi — akışın geldiği kenardan c/4 → fiziksel kordun 3/4'ü;
+        # tam ayrılmış akışta (t→1) düz levha gibi orta korda (0.5) iner (ileri akışla sürekli).
+        CD += float(np.interp(a_e, _REV_A, _REV_DCD))
+        return -CL, CD, False, 0.75 - 0.25 * t
 
     # Bez yelken
     if a_e < p.alpha_luff:
@@ -273,6 +375,13 @@ def sail_forces(aw_b, delta_s, sail_type, p):
     rot = np.array([-w[1], w[0]])
     L_dir = -np.sign(cross) * rot if abs(cross) > 1e-12 else rot
     F = q * (CL * L_dir + CD * w)                    # kaldırma ⟂ akış, sürükleme ∥ akış
+    # YALNIZ ETİKET (kuvvetleri etkilemez; sail_coeffs bu bayrağı kullanmaz): rüzgar, bumbanın açıldığı tarafın
+    # DIŞ yüzüne çarpıyorsa kumaş ters dolmuştur. Bumba rüzgarüstündeyken de, rüzgaraltında ama görünür rüzgar
+    # açısından fazla açılmışken de (rijit bumba) geçerli. Iskotada bu durum çırpmaya dönüştüğü için oluşmaz.
+    if flapping:
+        backwinded = False                          # akışa hizalı çırpan yelken ters dolmuş sayılmaz
+    elif sail_type == "soft" and abs(delta_s) > 1.0:
+        backwinded = bool(cross * delta_s < 0.0)
     out.update(Fx=float(F[0]), Fy=float(F[1]), alpha=a_abs, flapping=flapping, backwinded=backwinded, cp=cp)
     return out
 
@@ -538,7 +647,7 @@ def solve_equilibrium(heading, tws_kt, delta_r, trim_auto, trim_manual, sail_typ
     return res
 
 
-@lru_cache(maxsize=64)
+@persistent_lru(maxsize=64)
 def nogo_limit(tws_kt, sail_type, p):
     """Fiziksel ölü açı sınırı (TWA, °): optimum trim ve dümen 0 ile KONTROLLÜ ileri dengenin
     ilk var olduğu açı. Sabit bir ζ kabulü YOK — tamamen kuvvet dengesinden (ikiye bölme, 0.1°)."""
@@ -1161,6 +1270,7 @@ section[data-testid="stSidebar"] > div {{ width:300px !important; }}
           overflow:hidden; text-overflow:ellipsis; }}
 .ck-val {{ font-size:27px; font-weight:800; line-height:1.15; white-space:nowrap; font-variant-numeric:tabular-nums; }}
 .ck-unit {{ font-size:14px; font-weight:600; color:{MUTED}; margin-left:3px; }}
+.ck-sub {{ font-size:12px; font-weight:600; color:#FCA5A5; margin-left:8px; letter-spacing:0; }}
 .ck-badge {{ display:flex; flex-direction:column; justify-content:center; align-items:center; min-width:150px;
             border-radius:12px; padding:6px 14px; font-weight:800; letter-spacing:.08em; color:#0F172A;
             cursor:help; text-align:center; }}
@@ -1180,9 +1290,25 @@ div[data-testid="stPlotlyChart"] {{ background:{BG}; border-radius:12px; overflo
 .st-key-hero [data-testid="stElementContainer"] {{ height:100% !important; }}
 .ck-row {{ margin-bottom:18px; }}
 [data-testid="stSidebar"] button[kind] {{ height:46px; font-weight:700; }}
+.sb-h {{ margin:10px 0 2px !important; padding-top:8px; border-top:1px solid #1E293B; }}
+.sb-h.sb-first {{ border-top:none; padding-top:0; margin-top:0 !important; }}
+.sb-note {{ font-size:12.5px; color:{MUTED}; background:{PANEL}; border:1px solid #334155; border-radius:10px;
+           padding:7px 10px; line-height:1.45; }}
+.sb-note b {{ color:{TXT}; }}
+.pm-h {{ font-size:11px; letter-spacing:.07em; text-transform:uppercase; color:#7DD3FC; font-weight:700;
+        margin:14px 0 6px; padding-bottom:3px; border-bottom:1px solid #1E293B; }}
+[data-testid="stSidebarNav"] {{ padding-bottom:4px; }}
+[data-testid="stSidebarNav"] a span {{ font-weight:600; }}
 /* Kendi HTML bloklarımız: Streamlit'in markdown alt boşluk düzeltmesi (−16px) bloklarımızı üst üste bindiriyordu */
-[data-testid="stMarkdownContainer"]:has(> .ck-panel, > .ck-chips, > .ck-h, > .rt-title, > .rt-tbl) {{ margin-bottom:0 !important; }}
+[data-testid="stMarkdownContainer"]:has(> .ck-panel, > .ck-chips, > .ck-h, > .rt-title, > .rt-head, > .rt-tbl, > .pm-h, > .sb-note) {{ margin-bottom:0 !important; }}
 .rt-title {{ font-size:22px; font-weight:800; margin:2px 0 4px; }}
+.rt-head {{ display:flex; gap:10px; align-items:stretch; flex-wrap:wrap; }}
+.rt-head .rt-title {{ flex:0 0 auto; align-self:center; margin:0 8px 0 0; font-size:21px; white-space:nowrap; }}
+.rt-head .ck-card {{ padding:5px 12px; min-width:120px; }}
+.rt-head .ck-lbl {{ font-size:10.5px; }}
+.rt-head .ck-val {{ font-size:20px; }}
+.rt-head .ck-chip {{ align-self:center; }}
+.rt-i {{ font-size:14px; font-weight:600; color:{MUTED}; cursor:help; margin-left:4px; vertical-align:middle; }}
 .rt-desc {{ color:{MUTED}; font-size:13px; line-height:1.45; margin-bottom:6px; }}
 .rt-sum {{ flex-wrap:wrap; margin-bottom:10px !important; }}
 .rt-sum .ck-card {{ min-width:150px; }}
@@ -1199,6 +1325,21 @@ div[data-testid="stPlotlyChart"] {{ background:{BG}; border-radius:12px; overflo
 [class*="st-key-pair_"] [data-testid="stNumberInputStepUp"],
 [class*="st-key-pair_"] [data-testid="stNumberInputStepDown"] {{ display:none !important; }}
 [class*="st-key-pair_"] [data-testid="stNumberInputField"] {{ text-align:center; padding-left:4px; padding-right:4px; }}
+/* Kaydırıcı tam genişlik; sayı kutusu etiket satırının sağında (değer iki kez yazılmaz). Yalnız görünüm. */
+[class*="st-key-pair_"] [data-testid="stHorizontalBlock"] {{ display:block !important; position:relative; }}
+[class*="st-key-pair_"] [data-testid="stColumn"]:first-child {{ width:100% !important; }}
+[class*="st-key-pair_"] [data-testid="stColumn"]:last-child {{ position:absolute; top:-3px; right:0;
+    width:68px !important; min-width:0 !important; }}
+[class*="st-key-pair_"] [data-testid="stColumn"]:last-child [data-baseweb="input"] {{ height:30px; }}
+[class*="st-key-pair_"] [data-testid="stSlider"] [data-testid="stWidgetLabel"] {{ padding-right:76px; }}
+[class*="st-key-pair_"] [data-testid="stSliderThumbValue"] {{ opacity:0; }}
+/* Simülasyon pencereleri ekran boyuna uyar (geniş ekran); dar ekranda eski sabit yükseklik */
+@media (min-width: 1200px) and (min-height: 640px) {{
+  .st-key-rtview iframe {{ height:calc(100vh - 208px) !important; min-height:470px; }}
+  .st-key-drview iframe {{ height:calc(100vh - 74px) !important; min-height:470px; }}
+  .st-key-rtview [data-testid="stElementContainer"], .st-key-drview [data-testid="stElementContainer"] {{
+    height:auto !important; flex:0 0 auto !important; }}
+}}
 </style>
 """
 
@@ -1207,9 +1348,10 @@ def _esc(s):
     return (str(s).replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def _card(label, value, unit, color, tip):
+def _card(label, value, unit, color, tip, sub=None):
+    sub_html = f'<span class="ck-sub">{sub}</span>' if sub else ""
     return (f'<div class="ck-card" title="{_esc(tip)}"><div class="ck-lbl">{label} ⓘ</div>'
-            f'<div class="ck-val" style="color:{color}">{value}<span class="ck-unit">{unit}</span></div></div>')
+            f'<div class="ck-val" style="color:{color}">{value}<span class="ck-unit">{unit}</span>{sub_html}</div></div>')
 
 
 def _row(label, value, tip, color=TXT):
@@ -1249,29 +1391,20 @@ def _slider_box(label, lo, hi, default, step, key, help=None):
 ROUTE_FIELDS = ("t", "x", "y", "h", "V", "r", "e", "s", "psi_star", "o_P", "o_I", "o_D", "o_FF", "dpsi", "i_P",
                 "i_I", "i_D", "g", "cmd", "dr", "ds", "beta", "aaw", "Fx", "Fy", "X_r", "Y_r", "Y_h", "R", "N_s",
                 "N_r", "lam", "cog", "twa", "alpha", "eps", "N_h", "N_munk")
+ARRIVE_TOL = 5.0           # m: B hizası geçilirken rotaya uzaklık bundan küçükse "varış" (≈3 tekne boyu; yalnız gösterim)
 ROUTE_VIEW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "route_view.html")
 
 
-@st.cache_data(show_spinner=False, max_entries=16)
-def _route_cached(A, B, e0, head_err, tws_kt, trim_auto, trim_manual, sail_type, p_vals, ap_vals):
-    return simulate_route(A, B, e0, head_err, tws_kt, trim_auto, trim_manual, sail_type,
-                          Params(*p_vals), Autopilot(*ap_vals))
-
-
-def _route_html(res, ph, tws_kt, sail_type, p, ap):
-    data = {k: np.round(np.asarray(res[k], dtype=float), 3).tolist() for k in ROUTE_FIELDS}
-    data["clamp"] = [bool(v) for v in res["clamp"]]
-    data["flap"] = [bool(v) for v in res["flap"]]
-    data["phase"] = ph["phase"].tolist()
-    data["meta"] = dict(
-        phases=dict(names=PHASES, i_turn=ph["i_turn"], i_settle=ph["i_settle"], band=ph["band"]),
-        A=res["A"].tolist(), B=res["B"].tolist(), P0=res["P0"].tolist(), chi=res["chi"], L=res["L"],
-        lim=res["lim"], status=res["status"], t_end=res["t_end"], t_max=res["t_max"], tws_kt=tws_kt, rec_dt=0.25,
-        boat=dict(L=p.L, sep=p.hull_sep, x_mast=p.x_mast,
+def _route_html(rt, env, ap, e0, tws_kt, sail_type, p):
+    """A→B görüntüleyicisi: benzetim tarayıcıda (sim_physics.js). Python yalnız başlangıç koşullarını ve ortamı yollar."""
+    data = dict(rt=rt, env=env, ap={k: getattr(ap, k) for k in ap.__dataclass_fields__}, e0=e0, meta=dict(
+        phase_names=PHASES, band=SETTLE_BAND, tws_kt=tws_kt, rec_dt=0.25, arrive_tol=ARRIVE_TOL, sail=sail_type,
+        csv_cols=[list(c) for c in ROUTE_CSV],
+        boat=dict(L=p.L, sep=p.hull_sep, x_mast=p.x_mast, chord=p.chord_wing,
                   boom=p.boom_len if sail_type == "soft" else 0.75 * p.chord_wing),
-        ap=dict(dpsi_max=ap.dpsi_max, rud_max=ap.rud_max, gain_sched=ap.gain_sched))
-    with open(ROUTE_VIEW, encoding="utf-8") as fh:
-        return fh.read().replace("__DATA__", json.dumps(data))
+        ap=dict(dpsi_max=ap.dpsi_max, rud_max=ap.rud_max, gain_sched=ap.gain_sched)))
+    with open(ROUTE_VIEW, encoding="utf-8") as fh, open(SIM_JS, encoding="utf-8") as fs:
+        return fh.read().replace("/*__SIM__*/", fs.read()).replace("__DATA__", json.dumps(data))
 
 
 def _pnum(col, label, lo, hi, default, step, key, **kw):
@@ -1293,27 +1426,44 @@ def _ptoggle(col, label, default, key, **kw):
     return st.session_state[key]
 
 
-def _route_controls(flat=False):
+def _route_controls(flat=False, compact=False):
     """A→B senaryosu ve otopilot ayarları. A→B Rota ve Kumanda sayfalarında ortak; sayfa değişince korunur.
-    flat: PID ayarları ayrı açılır kutusuz (zaten bir açılır kutunun içindeyken)."""
+    flat: PID ayarları ayrı açılır kutusuz (zaten bir açılır kutunun içindeyken).
+    compact: A, B ve başlangıç tek sırada; telafi anahtarları otopilot açılır kutusunda (anahtarlar aynı)."""
     d = Autopilot()
-    c = st.columns(4)
-    ax = _pnum(c[0], "A · Doğu x (m)", -5000.0, 5000.0, 0.0, 10.0, "rt_ax")
-    ay = _pnum(c[1], "A · Kuzey y (m)", -5000.0, 5000.0, 0.0, 10.0, "rt_ay")
-    bx = _pnum(c[2], "B · Doğu x (m)", -5000.0, 5000.0, 200.0, 10.0, "rt_bx")
-    by = _pnum(c[3], "B · Kuzey y (m)", -5000.0, 5000.0, 0.0, 10.0, "rt_by")
-    c = st.columns(4, vertical_alignment="bottom")
-    e0 = _pnum(c[0], "Başlangıç sapması (m)", -500.0, 500.0, 30.0, 5.0, "rt_e0",
+    if compact:
+        c = st.columns(6, vertical_alignment="bottom")
+        c_ab, c_e = c[:4], c[4:]
+    else:
+        c_ab = st.columns(4)
+        c_e = st.columns(4, vertical_alignment="bottom")[:2]
+    ax = _pnum(c_ab[0], "A · Doğu x (m)", -5000.0, 5000.0, 0.0, 10.0, "rt_ax")
+    ay = _pnum(c_ab[1], "A · Kuzey y (m)", -5000.0, 5000.0, 0.0, 10.0, "rt_ay")
+    bx = _pnum(c_ab[2], "B · Doğu x (m)", -5000.0, 5000.0, 200.0, 10.0, "rt_bx")
+    by = _pnum(c_ab[3], "B · Kuzey y (m)", -5000.0, 5000.0, 0.0, 10.0, "rt_by")
+    e0 = _pnum(c_e[0], "Başlangıç sapması (m)", -500.0, 500.0, 30.0, 5.0, "rt_e0",
                help="Başlangıç noktasının A'dan rotaya dik uzaklığı e₀. + : rotanın sancak tarafı "
                     "(A'dan B'ye bakarken sağ), − : iskele tarafı.")
-    he = _pnum(c[1], "Pruva hatası (°)", -180.0, 180.0, 0.0, 5.0, "rt_he",
+    he = _pnum(c_e[1], "Pruva hatası (°)", -180.0, 180.0, 0.0, 5.0, "rt_he",
                help="Başlangıç pruvası = rota açısı χ + bu değer. Tekne o pruvadaki durağan hızla başlar.")
-    c = st.columns(2)
-    ff = _ptoggle(c[0], "Yan kayma telafisi (ileri besleme)", d.leeway_ff, "rt_ff",
-                  help="Hedef pruvadan yan kayma açısı λ çıkarılır; böylece teknenin GİDİŞ yönü (COG) rotaya oturur.")
-    gs = _ptoggle(c[1], "Hıza göre kazanç", d.gain_sched, "rt_gs",
-                  help="Dümen etkinliği hızın karesiyle değişir; iç döngü kazancı (V_ref/V)² ile ölçeklenir (×0.5–×3).")
-    with st.container() if flat else st.expander("PID kazançları ve dümen sınırları", expanded=False):
+
+    def toggles():
+        c = st.columns(2)
+        ff_ = _ptoggle(c[0], "Yan kayma telafisi (ileri besleme)", d.leeway_ff, "rt_ff",
+                       help="Hedef pruvadan yan kayma açısı λ çıkarılır; böylece teknenin GİDİŞ yönü (COG) rotaya "
+                            "oturur.")
+        gs_ = _ptoggle(c[1], "Hıza göre kazanç", d.gain_sched, "rt_gs",
+                       help="Dümen etkinliği hızın karesiyle değişir; iç döngü kazancı (V_ref/V)² ile ölçeklenir "
+                            "(×0.5–×3).")
+        return ff_, gs_
+
+    if not compact:
+        ff, gs = toggles()
+    box_lbl = ("⚙️ Otopilot ayarları · PID kazançları, dümen sınırları, yan kayma telafisi" if compact
+               else "PID kazançları ve dümen sınırları")
+    with st.container() if flat else st.expander(box_lbl, expanded=False):
+        if compact:
+            ff, gs = toggles()
         if flat:
             st.caption("PID kazançları ve dümen sınırları")
         c = st.columns(4, vertical_alignment="bottom")
@@ -1340,82 +1490,50 @@ def _route_ok(A, B):
     return True
 
 
+def _files_missing(*paths):
+    """Sayfanın ihtiyaç duyduğu yardımcı dosya yoksa çökmek yerine ne yapılacağını söyler."""
+    miss = [os.path.basename(f) for f in paths if not os.path.isfile(f)]
+    if miss:
+        st.error("Bu sayfa için gereken dosya bulunamadı: " + ", ".join(f"`{m}`" for m in miss) +
+                 ". Dosyayı GitHub reposunda `app.py` ile aynı klasöre yükleyin; uygulama birkaç saniye içinde "
+                 "kendini yeniler. (Kokpit sayfası bu dosyalar olmadan da çalışır.)")
+    return bool(miss)
+
+
+_RT_DESC = ("Tekne A'nın dışından başlar ve A–B doğrusuna oturmaya çalışır: dış döngü doğrudan sapmayı (e) ölçüp "
+            "hedef pruvayı (ψ*) verir, iç döngü pruva hatasından dümen açısını (δr) hesaplar. Fizik kokpitle aynıdır "
+            "(görünür rüzgarda yelken kuvvetleri, 3-DOF ataletli hareket, yan kayma, dümen stall'u); otopilot yalnız "
+            "dümeni yönetir. Yelken, rüzgar ve tekne parametreleri sol menüdedir. Rüzgar kuzeyden eser.")
+_RT_TITLE = f'<div class="rt-title">A→B Rota <span class="rt-i" title="{_RT_DESC}">ⓘ</span></div>'
+
+
 def route_page(sail_type, tws_kt, trim_auto, trim_manual, p):
-    st.markdown('<div class="rt-title">A\'dan B\'ye düz rota · kaskad PID otopilot</div>'
-                '<div class="rt-desc">Tekne A\'nın dışından başlar ve A–B doğrusuna oturmaya çalışır: dış döngü '
-                'doğrudan sapmayı (e) ölçüp hedef pruvayı (ψ*) verir, iç döngü pruva hatasından dümen açısını (δr) '
-                'hesaplar. Fizik kokpitle <b>aynıdır</b> (görünür rüzgarda yelken kuvvetleri, 3-DOF ataletli hareket, '
-                'yan kayma, dümen stall\'u); otopilot yalnız dümeni yönetir. Yelken, rüzgar ve tekne parametreleri '
-                'sol menüdedir. Rüzgar kuzeyden eser.</div>', unsafe_allow_html=True)
-    (ax, ay), (bx, by), e0, he, ap = _route_controls()
+    if _files_missing(ROUTE_VIEW, SIM_JS):
+        return
+    head = st.empty()
+    head.markdown(f'<div class="rt-head">{_RT_TITLE}</div>', unsafe_allow_html=True)
+    (ax, ay), (bx, by), e0, he, ap = _route_controls(compact=True)
     if not _route_ok((ax, ay), (bx, by)):
         return
-    with st.spinner("Rota benzetimi hesaplanıyor…"):
-        res = _route_cached((ax, ay), (bx, by), e0, he, tws_kt, trim_auto, trim_manual, sail_type,
-                            astuple(p), astuple(ap))
-    twa_t = abs(wrap180(res["chi"] - WIND_FROM_DEG))
-    lim = res["lim"]
-    if res["track_nogo"]:
-        st.warning(f"Rota ölü açıda: rota TWA {twa_t:.0f}° < ölü açı sınırı ±{lim:.1f}°. Tekne bu doğru boyunca "
-                   "gidemez; otopilot hedef pruvayı ölü açı sınırında tutar. Bu sürümde tramola (zig-zag) yok.")
-    end_e = abs(float(res["e"][-1]))
+    rt = _route_start_cached((ax, ay), (bx, by), e0, he, tws_kt, trim_auto, trim_manual, sail_type, astuple(p))
+    twa_t = abs(wrap180(rt["chi"] - WIND_FROM_DEG))
+    lim = rt["lim"]
+    nogo_txt = (f"Rota ölü açıda: rota TWA {twa_t:.0f}° < ölü açı sınırı ±{lim:.1f}°. Tekne bu doğru boyunca "
+                "gidemez; otopilot hedef pruvayı ölü açı sınırında tutar. Bu sürümde tramola (zig-zag) yok."
+                if rt["track_nogo"] else None)
+    # Benzetimin kendisi tarayıcıda koşar (route_view.html: routeRun = simulate_route'un birebir karşılığı);
+    # varış süresi, son sapma, evreler, özet tablosu ve CSV pencerenin "Özet" sekmesindedir.
     cards = "".join([
-        _card("Rota açısı χ", f"{res['chi']:.1f}", "°", "#2DD4BF", "A'dan B'ye pusula açısı (0° = Kuzey)."),
-        _card("Mesafe", f"{res['L']:.0f}", "m", "#38BDF8", "A–B doğrusunun uzunluğu."),
-        _card("Rota TWA", f"{twa_t:.0f}", "°", "#EF4444" if res["track_nogo"] else "#FBBF24",
-              f"Rota boyunca gerçek rüzgar açısı. Ölü açı sınırı ±{lim:.1f}°." if lim else "Gerçek rüzgar açısı."),
-        _card("Varış süresi", f"{res['t_end']:.0f}" if res["status"] == "reached" else "—", "s", "#22C55E",
-              "B hizasının geçildiği an."),
-        _card("Son sapma |e|", f"{end_e:.2f}", "m", "#22C55E" if end_e < 1 else "#F59E0B",
-              "Benzetim sonunda rota doğrusuna uzaklık."),
+        _card("Rota açısı χ", f"{rt['chi']:.1f}", "°", "#2DD4BF", "A'dan B'ye pusula açısı (0° = Kuzey)."),
+        _card("Mesafe", f"{rt['L']:.0f}", "m", "#38BDF8", "A–B doğrusunun uzunluğu."),
+        _card("Rota TWA", f"{twa_t:.0f}", "°", "#EF4444" if rt["track_nogo"] else "#FBBF24",
+              nogo_txt or (f"Rota boyunca gerçek rüzgar açısı. Ölü açı sınırı ±{lim:.1f}°." if lim
+                           else "Gerçek rüzgar açısı."), sub="⚠ ölü açıda" if nogo_txt else None),
     ])
-    st.markdown(f'<div class="ck-row">{cards}</div>', unsafe_allow_html=True)
-    ph = route_phases(res, ap)
-    components.html(_route_html(res, ph, tws_kt, sail_type, p, ap), height=915, scrolling=True)
-    route_summary(res, ph, ap)
-
-
-def route_summary(res, ph, ap):
-    """Rapor için özet: ana sonuçlar, evre tablosu ve tüm zaman serisinin CSV'si."""
-    st.markdown('<div class="ck-h" style="margin-top:6px">Özet</div>', unsafe_allow_html=True)
-    f = lambda v, fmt, u="": "—" if v is None else f"{v:{fmt}}{u}"
-    hold = "—" if ph["dr_hold"] is None else f"{ph['dr_hold']:+.1f}° ±{ph['dr_hold_std']:.1f}"
-    cards = "".join([
-        _card("Oturma başladı", f(ph["t_turn"], ".1f"), "s", "#C084FC",
-              f"Dış döngünün doymadan çıktığı an (|Δψ| < Δψmax = {ap.dpsi_max:.0f}°): tekne rotaya en büyük açıyla "
-              "yaklaşmayı bırakıp dönmeye başlıyor."),
-        _card("Rotaya oturdu", f(ph["t_settle"], ".1f"), "s", "#2DD4BF",
-              f"Bu andan sonra sapma hep |e| < {ph['band']:.0f} m."),
-        _card("Aşım", f"{ph['overshoot']:.2f}", "m", "#F59E0B",
-              "Rotanın öbür tarafına en fazla ne kadar geçtiği."),
-        _card("En büyük dümen", f"{ph['dr_max']:+.1f}", "°", "#F87171",
-              f"{ph['t_dr_max']:.1f}. saniyede. Sınır ±{ap.rud_max:.0f}°."),
-        _card("Rotada dümen", hold, "", "#60A5FA",
-              "Rotaya oturduktan sonra ortalama dümen açısı ± standart sapma: yelkenin döndürme etkisini "
-              "dengeleyen açı."),
-        _card("Yol verimi", f(None if ph["eff"] is None else 100 * ph["eff"], ".0f"), "%", "#22C55E",
-              f"Rota boyunca ilerleme / gidilen yol ({ph['path_len']:.0f} m). %100 = hiç sapmadan düz gitmek."),
-    ])
-    st.markdown(f'<div class="ck-row rt-sum">{cards}</div>', unsafe_allow_html=True)
-    head = ("Evre", "Zaman aralığı (s)", "Süre (s)", "Ort. hız (kt)", "Ort. dümen δr (°)", "En büyük |δr| (°)",
-            "Ort. yelken δs (°)", "Ort. yan kayma λ (°)", "En büyük |e| (m)")
-    color = dict(zip(PHASES, ("#38BDF8", "#C084FC", "#2DD4BF")))
-    body = "".join(
-        f'<tr><td><i style="background:{color[r["name"]]}"></i>{r["name"]}</td>'
-        f'<td>{r["t0"]:.1f} – {r["t1"]:.1f}</td><td>{r["dur"]:.1f}</td><td>{r["V"]:.2f}</td>'
-        f'<td>{r["dr_mean"]:+.1f}</td><td>{r["dr_max"]:.1f}</td><td>{r["ds_mean"]:+.1f}</td>'
-        f'<td>{r["lam_mean"]:+.1f}</td><td>{r["e_max"]:.2f}</td></tr>' for r in ph["rows"])
-    st.markdown(f'<div class="rt-tbl"><table><thead><tr>{"".join(f"<th>{h}</th>" for h in head)}</tr></thead>'
-                f'<tbody>{body}</tbody></table></div>', unsafe_allow_html=True)
-    c = st.columns([1, 1, 2], vertical_alignment="center")
-    c[0].download_button("⬇ CSV · Excel (Türkçe)", route_csv(res, ph, excel_tr=True), "rota_benzetimi_excel.csv",
-                         "text/csv", use_container_width=True, key="rt_csv_tr",
-                         help="Türkçe Excel için: ';' ile ayrılmış, ondalık virgüllü.")
-    c[1].download_button("⬇ CSV · standart", route_csv(res, ph), "rota_benzetimi.csv", "text/csv",
-                         use_container_width=True, key="rt_csv",
-                         help="',' ile ayrılmış, ondalık noktalı (Python, MATLAB, İngilizce Excel).")
-    c[2].caption(f"Tüm zaman serisi, 0.25 s aralıkla {len(res['t'])} satır, {len(ROUTE_CSV)} sütun: konum, evre, "
-                 "açılar, hızlar, PID katkıları, kuvvetler ve momentler.")
+    head.markdown(f'<div class="rt-head">{_RT_TITLE}{cards}</div>', unsafe_allow_html=True)
+    env = sim_env(tws_kt, trim_auto, trim_manual, sail_type, p)
+    with st.container(key="rtview"):
+        components.html(_route_html(rt, env, ap, e0, tws_kt, sail_type, p), height=915, scrolling=True)
 
 
 # ----------------------------------------------------------------------------
@@ -1424,6 +1542,7 @@ def route_summary(res, ph, ap):
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DRIVE_VIEW, SIM_JS = os.path.join(_HERE, "drive_view.html"), os.path.join(_HERE, "sim_physics.js")
 DRIVE_URL = "kumanda"
+ROUTE_URL = "rota"
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1434,31 +1553,79 @@ def _route_start_cached(A, B, e0, head_err, tws_kt, trim_auto, trim_manual, sail
 def _drive_html(rt, env, ap, ghost, e0, tws_kt, sail_type, p):
     data = dict(env=env, rt=rt, ap={k: getattr(ap, k) for k in ap.__dataclass_fields__}, ghost=ghost, e0=e0,
                 meta=dict(tws_kt=tws_kt, lim=rt["lim"], sail=sail_type,
-                          boat=dict(L=p.L, sep=p.hull_sep, x_mast=p.x_mast,
+                          boat=dict(L=p.L, sep=p.hull_sep, x_mast=p.x_mast, chord=p.chord_wing,
                                     boom=p.boom_len if sail_type == "soft" else 0.75 * p.chord_wing)))
     with open(DRIVE_VIEW, encoding="utf-8") as fh, open(SIM_JS, encoding="utf-8") as fs:
         return fh.read().replace("/*__SIM__*/", fs.read()).replace("__DATA__", json.dumps(data))
 
 
+_DR_DESC = ("Tekneyi kumandayla (Xbox / PlayStation, USB ya da Bluetooth) veya klavyeyle sen yönetirsin. Fizik kokpit "
+            "ve A→B ile aynıdır (aynı denklemlerin tarayıcıda çalışan karşılığı, testle doğrulanır). Kumandayı "
+            "bağladıktan sonra bir tuşuna bas; tarayıcı ancak o zaman görür.")
+_DR_TITLE = f'<div class="rt-title">Kumanda ile sür <span class="rt-i" title="{_DR_DESC}">ⓘ</span></div>'
+
+
 def drive_page(sail_type, tws_kt, trim_auto, trim_manual, p):
-    st.markdown('<div class="rt-title">Kumanda ile sür · A\'dan B\'ye</div>'
-                '<div class="rt-desc">Tekneyi kumandayla (Xbox / PlayStation, USB ya da Bluetooth) veya klavyeyle sen '
-                'yönetirsin. Fizik kokpit ve A→B ile <b>aynıdır</b> (aynı denklemlerin tarayıcıda çalışan karşılığı, '
-                'testle doğrulanır). Kumandayı bağladıktan sonra bir tuşuna bas; tarayıcı ancak o zaman görür.</div>',
-                unsafe_allow_html=True)
-    with st.expander("Senaryo ve otopilot ayarları (A, B, başlangıç, PID) · A→B Rota ile ortak", expanded=False):
+    if _files_missing(DRIVE_VIEW, SIM_JS):
+        return
+    c_t, c_x = st.columns([1, 3.2], vertical_alignment="center")
+    head = c_t.empty()
+    head.markdown(f'<div class="rt-head">{_DR_TITLE}</div>', unsafe_allow_html=True)
+    with c_x.expander("⚙️ Senaryo ve otopilot ayarları (A, B, başlangıç, PID) · A→B Rota ile ortak", expanded=False):
         A, B, e0, he, ap = _route_controls(flat=True)
     if not _route_ok(A, B):
         return
     with st.spinner("Senaryo hazırlanıyor…"):
         rt = _route_start_cached(A, B, e0, he, tws_kt, trim_auto, trim_manual, sail_type, astuple(p))
-        res = _route_cached(A, B, e0, he, tws_kt, trim_auto, trim_manual, sail_type, astuple(p), astuple(ap))
-    ghost = dict(x=np.round(res["x"], 2).tolist(), y=np.round(res["y"], 2).tolist(),
-                 t_end=res["t_end"] if res["status"] == "reached" else None)
+    ghost = None          # otopilotun hayalet yolu tarayıcıda hesaplanır (drive_view: ghostRun, Python ile aynı adımlar)
     if rt["track_nogo"]:
-        st.warning("Rota ölü açıda: tekne bu doğru boyunca doğrudan gidemez (tramola yok).")
+        head.markdown(f'<div class="rt-head">{_DR_TITLE}' + _chip("⚠ Rota ölü açıda", "#EF4444",
+                      "Tekne bu doğru boyunca doğrudan gidemez (tramola yok).") + '</div>', unsafe_allow_html=True)
     env = sim_env(tws_kt, trim_auto, trim_manual, sail_type, p)
-    components.html(_drive_html(rt, env, ap, ghost, e0, tws_kt, sail_type, p), height=800, scrolling=True)
+    with st.container(key="drview"):
+        components.html(_drive_html(rt, env, ap, ghost, e0, tws_kt, sail_type, p), height=800, scrolling=True)
+
+
+# Model parametreleri: (alan, etiket, alt, üst, adım, biçim, yardım). Anahtarlı → "Varsayılanlara dön" çalışır.
+PARAM_GROUPS = (
+    ("Tekne boyutları", (
+        ("L", "Boy L (m)", 0.5, 5.0, 0.05, None, None),
+        ("mass", "Kütle (kg)", 1.0, 200.0, 1.0, None, None),
+        ("hull_sep", "Gövde aralığı (m)", 0.2, 2.0, 0.05, None, "İki gövdenin eksenleri arası."),
+        ("hull_B", "Gövde genişliği B (m)", 0.05, 0.6, 0.01, None, "Tek gövdenin su hattı genişliği."),
+        ("Cb", "Blok katsayısı Cb", 0.2, 0.8, 0.01, None, "Gövde dolgunluğu: su altı hacmi / (L·B·T)."))),
+    ("Direnç", (
+        ("C_R", "Artık direnç C_R", 0.0, 0.05, 0.001, "%.3f", "Dalga (artık) direnç katsayısı; sabit kabul."),
+        ("CDA_windage", "Su üstü CD·A (m²)", 0.0, 1.0, 0.01, None,
+         "Gövde, kiriş, direk ve kutuların rüzgar direnci (sürükleme katsayısı × alan)."),
+        ("CLa_hull", "Gövde yanal eğim (1/rad)", 0.2, 6.0, 0.1, None,
+         "Gövdenin yan kaymaya karşı ürettiği yanal kuvvetin eğimi."))),
+    ("Yelken", (
+        ("A_wing", "Kanat alanı (m²)", 0.05, 3.0, 0.01, None, None),
+        ("A_soft", "Bez yelken alanı (m²)", 0.05, 3.0, 0.01, None, None),
+        ("x_mast", "Direk konumu x (m)", -0.8, 0.8, 0.01, None, "Tekne ortasından ölçülür; + pruvaya doğru."),
+        ("h_CE", "Basınç merk. yüksekliği (m)", 0.1, 3.0, 0.05, None,
+         "Yatırma momenti kolu: yelken basınç merkezinin sudaki yanal direnç merkezine göre dikey yüksekliği. "
+         "Yalnız devrilme uyarısında kullanılır."))),
+    ("Dümen ve denge", (
+        ("A_rud", "Dümen alanı (m²)", 0.005, 0.2, 0.005, "%.3f", None),
+        ("x_CLR", "Yanal direnç merk. x (m)", -0.8, 0.8, 0.01, None,
+         "Gövdelerin yanal kuvvet merkezi; tekne ortasından, + pruvaya doğru. Yelken basınç merkezine göre "
+         "konumu orsa/boca eğilimini belirler."),
+        ("zeta_deg", "Eq.(12) referans ζ (°)", 20.0, 70.0, 1.0, None,
+         "Jaulin 2013 Eq.(12) ölü açısı; yalnız karşılaştırma çizgisi olarak çizilir."))),
+)
+
+
+def _reset_params():
+    d = Params()
+    for _, fields in PARAM_GROUPS:
+        for f in fields:
+            st.session_state[f"pm_{f[0]}"] = float(getattr(d, f[0]))
+
+
+def _sidebar_note(text):
+    st.markdown(f'<div class="sb-note">{text}</div>', unsafe_allow_html=True)
 
 
 def main():
@@ -1467,51 +1634,57 @@ def main():
     if "sail" not in st.session_state:
         st.session_state["sail"] = "wing"
 
-    # ---------------- Sayfalar: Simülasyon (Kokpit, A→B) ve ayrı Kumanda sayfası (/kumanda) ----------------
-    def simulasyon():
-        if cockpit:
-            cockpit_page(heading, delta_r, horizon, *page_args)
-        else:
-            route_page(*page_args)
+    # ---------------- Üç eş düzey sayfa (değerler sayfalar arasında korunur) ----------------
+    def pg_cockpit():
+        cockpit_page(heading, delta_r, horizon, *page_args)
 
-    def kumanda():
+    def pg_route():
+        route_page(*page_args)
+
+    def pg_drive():
         drive_page(*page_args)
 
-    page = st.navigation([st.Page(simulasyon, title="Simülasyon", icon="⛵", default=True),
-                          st.Page(kumanda, title="Kumanda ile sür", icon="🎮", url_path=DRIVE_URL)])
+    page = st.navigation([st.Page(pg_cockpit, title="Kokpit", icon="🧭", default=True),
+                          st.Page(pg_route, title="A→B Rota", icon="📍", url_path=ROUTE_URL),
+                          st.Page(pg_drive, title="Kumanda ile sür", icon="🎮", url_path=DRIVE_URL)])
+    cockpit = page.url_path not in (ROUTE_URL, DRIVE_URL)
 
-    # ---------------- Sol menü (iki sayfada ortak; sayfa değişince değerler korunur) ----------------
+    # ---------------- Sol menü ----------------
     with st.sidebar:
-        cockpit = False
-        if page.url_path != DRIVE_URL:
-            if "mode_val" not in st.session_state:
-                st.session_state["mode_val"] = "Kokpit"
-            st.session_state["mode"] = st.session_state["mode_val"]
-            cockpit = st.radio("Mod", ["Kokpit", "A→B Rota"], horizontal=True, key="mode",
-                               label_visibility="collapsed", on_change=_sync, args=("mode_val", "mode"),
-                               help="Kokpit: sabit pruva/dümen. A→B Rota: otopilot tekneyi A–B doğrusuna "
-                                    "oturtur.") == "Kokpit"
-        st.markdown('<div class="ck-h">Yelken</div>', unsafe_allow_html=True)
+        st.markdown('<div class="ck-h sb-h sb-first">⛵ Yelken</div>', unsafe_allow_html=True)
         b1, b2 = st.columns(2)
         b1.button("Sert Kanat", use_container_width=True, on_click=_set_sail, args=("wing",),
                   type="primary" if st.session_state["sail"] == "wing" else "secondary")
         b2.button("Bez Yelken", use_container_width=True, on_click=_set_sail, args=("soft",),
                   type="primary" if st.session_state["sail"] == "soft" else "secondary")
         sail_type = st.session_state["sail"]
-        if cockpit:                                   # A→B modunda pruva ve dümeni otopilot verir
+
+        if cockpit:                                   # A→B'de otopilot, kumandada sürücü yönetir
+            st.markdown('<div class="ck-h sb-h">🧭 Tekne kontrolü</div>', unsafe_allow_html=True)
             heading = _slider_box("Pruva θ (°)", 0, 360, 90, 1, "heading", help="0° = Kuzey, saat yönünde")
             delta_r = _slider_box("Merkezi dümen δr (°)", -35, 35, 0, 1, "rudder",
                                   help="+ sancağa, − iskeleye dönüş")
+        elif page.url_path == ROUTE_URL:
+            _sidebar_note("Pruva ve dümeni <b>otopilot</b> yönetir. A, B ve PID ayarları sayfanın üstündedir.")
+        else:
+            _sidebar_note("Pruva ve dümeni <b>sen</b> yönetirsin (kumanda ya da klavye). Senaryo ayarları "
+                          "sayfanın üstündeki açılır kutudadır.")
+
+        st.markdown('<div class="ck-h sb-h">🌬 Rüzgar</div>', unsafe_allow_html=True)
         tws_kt = _slider_box("Rüzgar hızı (kt)", 2, 30, 10, 1, "tws", help="Rüzgar yönü sabit: 0° (Kuzeyden)")
+
+        st.markdown('<div class="ck-h sb-h">🎚 Yelken trimi</div>', unsafe_allow_html=True)
         trim_on = st.toggle("Otomatik yelken trimi", value=True,
-                            help="Açık: her an itişi en büyük yapan açı (kuvvet hesabından). "
-                                 "Kapalı: yelken açısını elle ver.")
+                            help="Açık: yelken açısı otomatik ayarlanır. Yöntem 'Model parametreleri → Otomatik trim "
+                                 "yöntemi'nden seçilir (varsayılan: her an ileri itişi en büyük yapan açı; diğeri "
+                                 "Jaulin 2013 Eq.(11) kardioid kuralı). Kapalı: yelken açısını elle ver.")
         trim_manual = 45
         if not trim_on:
             trim_manual = _slider_box("Yelken açısı δs (°)", -90, 90, 45, 1, "trim",
                                       help="+ bumba sancakta. Iskotalı bez yelkende yalnız |δs| sınırdır.")
 
-        with st.expander("Model parametreleri (VARSAYIM)", expanded=False):
+        with st.expander("⚙️ Model parametreleri", expanded=False):
+            st.caption("Bu bölümdeki değerler **varsayımdır** (ölçülmemiş tahminler); kendi teknene göre değiştir.")
             auto_method = st.radio("Otomatik trim yöntemi", ["Optimum (maks. itiş)", "Jaulin Eq.(11) kardioid"],
                                    help="Optimum: kuvvet hesabından. Jaulin 2013 Eq.(11): kardioid kural.")
             boom_lbl = st.radio("Bez yelken bumba tahriki", ["Iskota (ip)", "Rijit servo"],
@@ -1520,47 +1693,62 @@ def main():
             if cockpit:
                 horizon = _slider_box("Rota süresi (s)", 5, 60, 20, 1, "horizon")
             d = Params()
-            p = replace(
-                d,
-                L=st.number_input("Boy L (m)", 0.5, 5.0, d.L, 0.05),
-                mass=st.number_input("Kütle (kg)", 1.0, 200.0, d.mass, 1.0),
-                hull_sep=st.number_input("Gövde aralığı (m)", 0.2, 2.0, d.hull_sep, 0.05),
-                hull_B=st.number_input("Tek gövde genişliği B (m)", 0.05, 0.6, d.hull_B, 0.01),
-                Cb=st.number_input("Blok katsayısı Cb", 0.2, 0.8, d.Cb, 0.01),
-                C_R=st.number_input("Artık direnç C_R", 0.0, 0.05, d.C_R, 0.001, format="%.3f"),
-                A_wing=st.number_input("Kanat alanı (m²)", 0.05, 3.0, d.A_wing, 0.01),
-                A_soft=st.number_input("Bez yelken alanı (m²)", 0.05, 3.0, d.A_soft, 0.01),
-                CDA_windage=st.number_input("Su üstü rüzgar direnci CD·A (m²)", 0.0, 1.0, d.CDA_windage, 0.01),
-                h_CE=st.number_input("Basınç merkezi kolu (m)", 0.1, 3.0, d.h_CE, 0.05),
-                CLa_hull=st.number_input("Gövde yanal eğim (1/rad)", 0.2, 6.0, d.CLa_hull, 0.1),
-                x_mast=st.number_input("Direk konumu x (m)", -0.8, 0.8, d.x_mast, 0.01),
-                x_CLR=st.number_input("Yanal direnç merkezi x (m)", -0.8, 0.8, d.x_CLR, 0.01),
-                A_rud=st.number_input("Dümen alanı (m²)", 0.005, 0.2, d.A_rud, 0.005, format="%.3f"),
-                k_munk=st.number_input("Munk katsayısı (1 = teorik)", 0.0, 1.5, d.k_munk, 0.05),
-                zeta_deg=st.number_input("Eq.(12) referans ζ (°)", 20.0, 70.0, d.zeta_deg, 1.0),
-                boom_rigid=boom_lbl.startswith("Rijit"),
-            )
-            st.caption(f"T = {p.draft * 100:.1f} cm · S = {p.S_wet:.2f} m² · m22 = {p.m22:.1f} kg · "
+            vals = {}
+            for title, fields in PARAM_GROUPS:
+                st.markdown(f'<div class="pm-h">{title}</div>', unsafe_allow_html=True)
+                for name, label, lo, hi, step, fmt, hlp in fields:
+                    kw = dict(format=fmt) if fmt else {}
+                    if f"pm_{name}" not in st.session_state:          # başlangıç değeri yalnız session_state'ten
+                        st.session_state[f"pm_{name}"] = float(getattr(d, name))
+                    vals[name] = st.number_input(label, lo, hi, step=step, key=f"pm_{name}", help=hlp, **kw)
+            p = replace(d, boom_rigid=boom_lbl.startswith("Rijit"), **vals)
+            st.caption(f"Türetilen: T = {p.draft * 100:.1f} cm · S = {p.S_wet:.2f} m² · m22 = {p.m22:.1f} kg · "
                        f"Iz = {p.Iz:.1f} kg·m² · RM = {p.righting_moment:.0f} N·m")
+            st.button("↺ Varsayılanlara dön", on_click=_reset_params, use_container_width=True,
+                      help="Yukarıdaki tekne, direnç, yelken ve dümen parametrelerini başlangıç değerlerine döndürür.")
 
     trim_auto = ("opt" if auto_method.startswith("Optimum") else True) if trim_on else False
     page_args = (sail_type, tws_kt, trim_auto, trim_manual, p)
     page.run()
 
 
-def cockpit_page(heading, delta_r, horizon, sail_type, tws_kt, trim_auto, trim_manual, p):
-    # ---------------- Fizik (değişmedi) ----------------
+@st.cache_data(show_spinner=False, max_entries=256)
+def _cockpit_cached(heading, delta_r, horizon, sail_type, tws_kt, trim_auto, trim_manual, p_vals):
+    """Kokpitin tüm fizik çıktıları (önbellekli; aynı girdilere dönüşte yeniden hesap yok). Fizik değişmedi."""
+    p = Params(*p_vals)
     eq = solve_equilibrium(heading, tws_kt, delta_r, trim_auto, trim_manual, sail_type, p)
     path, _ = predict_path(heading, tws_kt, delta_r, trim_auto, trim_manual, sail_type, p, horizon)
     lim = nogo_limit(tws_kt, sail_type, p)
-    status, scol, twa = point_of_sail(heading, eq, lim)
     # Yol alarak başlayan tekne rota boyunca ölü açıya girip orada TAKILIYORSA rozet bunu gösterir
     # (girip kendiliğinden çıkabiliyorsa rozet başlangıç durumunda kalır).
     trap = nogo_trap(path, tws_kt, delta_r, trim_auto, trim_manual, sail_type, p, lim) if eq["V"] > 0 else None
+    return eq, path, lim, trap
+
+
+def cockpit_page(heading, delta_r, horizon, sail_type, tws_kt, trim_auto, trim_manual, p):
+    # ---------------- Fizik (değişmedi; önbellekli) ----------------
+    eq, path, lim, trap = _cockpit_cached(heading, delta_r, horizon, sail_type, tws_kt, trim_auto, trim_manual,
+                                          astuple(p))
+    status, scol, twa = point_of_sail(heading, eq, lim)
     if trap is not None:
         status, scol = "ÖLÜ AÇIDA KALDI", "#C0392B"
-    eq0 = eq if delta_r == 0 else solve_equilibrium(heading, tws_kt, 0, trim_auto, trim_manual, sail_type, p)
     rel_wind = wrap180(WIND_FROM_DEG - heading)
+    in_nogo = lim is None or twa < lim               # başlangıç pruvası ölü açıda mı (etiketler için)
+
+    # Durağan ileri denge yoksa (V = 0) yönelim/hız bilgisi DİNAMİK rotadan özetlenir (fizik değişmez;
+    # aynı predict_path çıktısı yalnız okunur).
+    dyn = None
+    if eq["V"] == 0 and len(path) > 1:
+        hu = np.degrees(np.unwrap(np.radians(path[:, 4])))
+        T_end = float(path[-1, 2])
+        u_end, v_end = float(path[-1, 5]), float(path[-1, 6])
+        moving_end = math.hypot(u_end, v_end) > 0.02
+        dyn = dict(dh=float(hu[-1] - hu[0]), rate=float(hu[-1] - hu[0]) / T_end if T_end > 0 else 0.0,
+                   u_mean=float(path[:, 5].mean()), u_min=float(path[:, 5].min()),
+                   v_max=float(path[:, 3].max()), dist=float(math.hypot(path[-1, 0], path[-1, 1])),
+                   cog_end=(path[-1, 4] + math.degrees(math.atan2(v_end, u_end))) % 360.0 if moving_end else None,
+                   astern_end=moving_end and u_end < 0)
+        dyn["astern"] = dyn["u_mean"] < -0.02
 
     # ---------------- Üst şerit: 4 kart + durum kapsülü ----------------
     badge_txt = {"ÖLÜ AÇI (No-Go Zone)": "NO-GO", "YOL YOK — trim uygun değil": "YOL YOK"}.get(status, status)
@@ -1575,9 +1763,19 @@ def cockpit_page(heading, delta_r, horizon, sail_type, tws_kt, trim_auto, trim_m
                       f"çıkmaya yetmiyor (rota sonundan 60 s daha simüle edildi; tekne ölü açıda kaldı).")
         badge_sub = f"{trap:.0f}. s'de takıldı"
     drift_txt = "—" if eq["lam"] is None else f"{eq['lam']:+.1f}"
+    v_tip = "Durağan denge hızı: yelken itişi = toplam su direnci (gövde + dümen + indüklenmiş)."
+    v_sub = None
+    if dyn is not None:
+        if dyn["astern"]:
+            v_sub = f"geri {-dyn['u_min'] / KT2MS:.2f} kt"
+            v_tip += (f" Bu pruvada ileri denge yok; dinamik rotada tekne GERİ gidiyor (en çok "
+                      f"{-dyn['u_min'] / KT2MS:.2f} kt).")
+        elif dyn["v_max"] > 0.05:
+            v_sub = f"dinamik ≤{dyn['v_max'] / KT2MS:.2f} kt"
+            v_tip += (f" Bu pruvada ileri denge yok; dinamik rotada en yüksek hız "
+                      f"{dyn['v_max'] / KT2MS:.2f} kt.")
     cards = "".join([
-        _card("Tahmini hız", f"{eq['V'] / KT2MS:.2f}", "kt", "#38BDF8",
-              "Durağan denge hızı: yelken itişi = toplam su direnci (gövde + dümen + indüklenmiş)."),
+        _card("Tahmini hız", f"{eq['V'] / KT2MS:.2f}", "kt", "#38BDF8", v_tip, sub=v_sub),
         _card("İleri itiş Fx", f"{eq['Fx']:+.1f}", "N", "#22C55E",
               "Yelken + su üstü rüzgar direncinin pruva yönündeki bileşeni (gövde ekseni)."),
         _card("Yanal Fy", f"{eq['Fy']:+.1f}", "N", "#EF4444",
@@ -1602,18 +1800,35 @@ def cockpit_page(heading, delta_r, horizon, sail_type, tws_kt, trim_auto, trim_m
             hero.plotly_chart(fig, use_container_width=True, config=cfg)
 
     with c_side:
-        if eq["V"] > 0 and abs(eq["r"]) > 0.05:
-            turn = ("Sancağa ↻" if eq["r"] > 0 else "İskeleye ↺") + \
-                   (" · orsa" if np.sign(eq["r"]) == np.sign(rel_wind) else " · boca")
-        else:
-            turn = "Düz"
+        def turn_name(rate):
+            if abs(rate) <= 0.05:
+                return "Düz"
+            return ("Sancağa ↻" if rate > 0 else "İskeleye ↺") + \
+                   (" · orsa" if np.sign(rate) == np.sign(rel_wind) else " · boca")
+
         end_h = path[-1, 4] if len(path) > 1 else heading
+        if dyn is None:                               # durağan denge var: değerler dengeden
+            turn = turn_name(eq["r"]) if eq["V"] > 0 else "Düz"
+            phi_row = _row("Hareket yönü φ", "—" if eq["V"] == 0 else f"{eq['course'] % 360:.1f}°",
+                           "Teknenin suya göre gerçekte gittiği yön = pruva + drift", "#22D3EE")
+            r_row = _row("Dönüş", f"{eq['r']:+.2f}°/s", f"{turn}. + sancağa (saat yönü).", "#E2E8F0")
+            R_row = _row("Dönüş yarıçapı", "∞" if not math.isfinite(eq["radius"]) else f"{eq['radius']:.1f} m",
+                         "Durağan dönüş: R = V / r")
+        else:                                         # denge yok: dinamik rotanın özeti
+            turn = turn_name(dyn["rate"]) + (" (dinamik)" if abs(dyn["rate"]) > 0.05 else "")
+            phi_txt = "—" if dyn["cog_end"] is None else \
+                f"{dyn['cog_end']:.0f}°" + (" · geri" if dyn["astern_end"] else "")
+            phi_row = _row("Hareket yönü φ", phi_txt,
+                           f"Durağan denge yok. Dinamik rotanın sonunda ({horizon} s) teknenin gerçekte gittiği yön."
+                           + (" Tekne geri gidiyor." if dyn["astern_end"] else ""), "#22D3EE")
+            r_row = _row("Dönüş (ort.)", f"{dyn['rate']:+.2f}°/s",
+                         f"Durağan denge yok; dinamik rotada {horizon} s boyunca ortalama dönüş hızı "
+                         f"(net {dyn['dh']:+.0f}°). {turn_name(dyn['rate'])}. + sancağa (saat yönü).", "#E2E8F0")
+            R_row = _row("Dönüş yarıçapı", "—", "Durağan dönüş yok (ileri denge hızı sıfır).")
         rows = "".join([
-            _row("Hareket yönü φ", "—" if eq["V"] == 0 else f"{eq['course'] % 360:.1f}°",
-                 "Teknenin suya göre gerçekte gittiği yön = pruva + drift", "#22D3EE"),
-            _row("Dönüş", f"{eq['r']:+.2f}°/s", f"{turn}. + sancağa (saat yönü).", "#E2E8F0"),
-            _row("Dönüş yarıçapı", "∞" if not math.isfinite(eq["radius"]) else f"{eq['radius']:.1f} m",
-                 "Durağan dönüş: R = V / r"),
+            phi_row,
+            r_row,
+            R_row,
             _row("Düz rota dümeni", "—" if eq["d_bal"] is None else f"{eq['d_bal']:+.1f}°",
                  "r = 0 için gereken merkezi dümen açısı (yelken + Munk momentini dengeler)", "#60A5FA"),
             _row(f"{horizon} s sonra pruva", f"{end_h:.0f}°",
@@ -1652,19 +1867,31 @@ def cockpit_page(heading, delta_r, horizon, sail_type, tws_kt, trim_auto, trim_m
         elif eq["backwinded"]:
             chips.append(_chip("⇄ Ters dolmuş", "#C084FC",
                                "Rijit bumba rüzgarüstünde: kamburu ters dönen yelken tekneyi geri/yana itiyor."))
-        if eq["V"] == 0 and len(path) > 1:
+        if dyn is not None:
             twa_t = np.abs(((path[:, 4] - WIND_FROM_DEG + 180) % 360) - 180)
             esc = np.where((twa_t > (lim or 180)) & (path[:, 5] > 0.05))[0]
-            umin = path[:, 5].min()
-            tip = (f"Dinamik: geriye en fazla {-umin:.2f} m/s, {horizon} s'de "
-                   f"{math.hypot(path[-1, 0], path[-1, 1]):.0f} m rüzgar altına sürüklenme. ")
-            if len(esc):
-                chips.append(_chip(f"↘ Pruva {path[esc[0], 2]:.0f} s'de düşüyor", "#22C55E",
-                                   tip + "Ardından tekne yeniden yol alıyor."))
+            tip = (f"Dinamik ({horizon} s): " + (f"geriye en çok {-dyn['u_min']:.2f} m/s, " if dyn["u_min"] < -0.02
+                                                 else "") + f"başlangıçtan {dyn['dist']:.0f} m uzaklaşma. ")
+            if in_nogo:                               # başlangıç ölü açıda
+                if len(esc):
+                    chips.append(_chip(f"↘ Pruva {path[esc[0], 2]:.0f} s'de düşüyor", "#22C55E",
+                                       tip + "Pruva ölü açı sınırını geçince tekne yeniden yol alıyor."))
+                else:
+                    chips.append(_chip("⟲ Ölü açıda kalıyor", "#EF4444",
+                                       tip + f"Pruva {horizon} s boyunca ölü açı sınırını (±{lim:.1f}°) geçemedi. "
+                                             "Kurtulma: dümen ya da ters yelken manevrası." if lim is not None else
+                                       tip + "Bu rüzgarda hiçbir pruvada ileri denge yok."))
+            elif len(esc):                            # ölü açıda değil, trim uygunsuz; sonradan yol alıyor
+                chips.append(_chip(f"↗ {path[esc[0], 2]:.0f} s'de yol alıyor", "#22C55E",
+                                   tip + "Seçili trimle durağan ileri denge yok; pruva döndükçe tekne ileri "
+                                         "yol almaya başlıyor."))
+            elif dyn["astern"]:                       # ölü açıda değil; yelken ters tarafta → geri seyir
+                chips.append(_chip("⇦ Geri seyir", "#F59E0B",
+                                   tip + "Tekne ölü açıda DEĞİL; seçili yelken açısında itiş geriye. "
+                                         "Optimum trimle bu pruvada ileri yol alınır."))
             else:
-                chips.append(_chip("⟲ Ölü açıda kalıyor", "#EF4444",
-                                   tip + "CE yanal direnç merkezinin gerisinde → rüzgara dönme eğilimi. "
-                                         "Kurtulma: dümen/ters yelken manevrası."))
+                chips.append(_chip("⊘ Yol alamıyor", "#F59E0B",
+                                   tip + "Tekne ölü açıda değil; seçili yelken açısı ileri itiş üretmiyor."))
         if trap is not None:
             chips.append(_chip("⟲ Ölü açıda kalıyor", "#EF4444",
                                f"Dinamik: {trap:.0f}. s'de ölü açıya (±{lim:.1f}°) giriyor; ileri hız dümenle "
@@ -1697,13 +1924,17 @@ def cockpit_page(heading, delta_r, horizon, sail_type, tws_kt, trim_auto, trim_m
                 st.caption(f"İleri: Fx {eq['Fx']:+.1f} N ↔ direnç {eq['R']:.1f} N · Fr {eq['Fr']:.2f} · "
                            f"yatırma {eq['HM']:.0f}/{eq['RM']:.0f} N·m")
             else:
-                st.caption("Tekne yol almıyor: durağan kuvvet dengesi yok (ölü açı).")
+                st.caption("Tekne yol almıyor: bu pruvada durağan ileri denge yok "
+                           + ("(ölü açı)." if in_nogo else "(seçili trimle itiş direnci yenemiyor).")
+                           + f" Yelken kuvvetleri: Fx {eq['Fx']:+.1f} N, Fy {eq['Fy']:+.1f} N.")
         with pc2.popover("Kaynaklar", use_container_width=True):
             st.caption(
                 "Morge et al. 2022 Eq.(1)-(2): görünür rüzgar. Jaulin & Le Bars 2013 Eq.(11): kardioid trim, "
                 "dümen işareti; Eq.(12) ζ yalnız referans. Ölü açı kuvvet dengesinden. Fossen 3-DOF (ek kütle, "
-                "Munk), şerit teorisi, ITTC-1957, Mumford ıslak alan, m·g·b/2 doğrultucu moment. VARSAYIM: "
-                "CL/CD eğrileri, C_R, CD·A, gövde eğimi, direk/CLR konumu, Munk katsayısı, dümen alanı.")
+                "Munk), şerit teorisi, ITTC-1957, Mumford ıslak alan, m·g·b/2 doğrultucu moment. Kanatta ters "
+                "akış (firar kenarı önde) ek sürüklemesi: NACA 0012 ölçümü, Sheldahl & Klimas 1981 "
+                "(SAND80-2114) Tablo 2, Re 360k. VARSAYIM: "
+                "CL/CD eğrileri, C_R, CD·A, gövde eğimi, direk/CLR konumu, dümen alanı. Munk momenti teorik değerinde (k = 1).")
 
 
 if __name__ == "__main__":
